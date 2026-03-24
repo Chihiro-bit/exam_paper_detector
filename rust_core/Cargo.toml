@@ -1,0 +1,54 @@
+[workspace]
+members = [
+    "common",
+    "image_processing",
+    "block_detection",
+    "ocr_adapter",
+    "question_locator",
+    "question_segmentation",
+    "detector_core",
+    "detector_ffi",
+]
+
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Exam Paper Detector Team"]
+license = "MIT"
+
+[workspace.dependencies]
+# 图像处理
+image = "0.25"
+imageproc = "0.25"
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 错误处理
+anyhow = "1.0"
+thiserror = "1.0"
+
+# 日志
+log = "0.4"
+env_logger = "0.11"
+
+# 正则
+regex = "1.10"
+
+# FFI
+libc = "0.2"
+
+# 数学计算
+num-traits = "0.2"
+
+# 内部依赖
+common = { path = "common" }
+image_processing = { path = "image_processing" }
+block_detection = { path = "block_detection" }
+ocr_adapter = { path = "ocr_adapter" }
+question_locator = { path = "question_locator" }
+question_segmentation = { path = "question_segmentation" }
+detector_core = { path = "detector_core" }

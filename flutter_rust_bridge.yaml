@@ -1,0 +1,17 @@
+# flutter_rust_bridge configuration
+
+# Rust source root
+rust_root: rust/
+
+# Rust input module path (new syntax)
+rust_input: crate::api
+
+# Dart output directory
+dart_output: lib/src
+
+# C output (optional, for advanced usage)
+c_output: rust/src/bridge_generated.h
+
+# Formatting
+dart_format_line_length: 120
+
