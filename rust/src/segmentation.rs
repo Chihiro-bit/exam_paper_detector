@@ -50,8 +50,9 @@ impl QuestionSegmenter {
                 continue;
             }
 
-            // 计算题目边界框（所有 blocks 的并集）
-            let bounding_box = self.calculate_bounding_box(&question_blocks, anchor);
+            // 计算题目边界框（使用完整的垂直范围，覆盖到下一题之前）
+            let margin = if i + 1 < anchors.len() { 3.0 } else { 0.0 };
+            let bounding_box = self.calculate_bounding_box(&question_blocks, anchor, y_end - margin);
 
             // 计算置信度
             let confidence = self.calculate_confidence(anchor, &question_blocks);
@@ -118,22 +119,36 @@ impl QuestionSegmenter {
     }
 
     /// 计算题目边界框
+    ///
+    /// 使用完整的垂直范围（从当前锚点到下一个锚点），
+    /// 水平范围覆盖所有 blocks 的最大宽度。
     fn calculate_bounding_box(
         &self,
         blocks: &[TextBlock],
         anchor: &QuestionAnchor,
+        y_end: f64,
     ) -> Rect {
         if blocks.is_empty() {
-            return anchor.bbox;
+            return Rect::new(anchor.bbox.x, anchor.bbox.y, anchor.bbox.width, y_end - anchor.bbox.y);
         }
 
-        // 从锚点开始，合并所有 blocks
-        let mut union_box = anchor.bbox;
-        for block in blocks {
-            union_box = union_box.union(&block.bbox);
-        }
+        // 水平范围：取所有 blocks 和 anchor 的最大范围
+        let min_x = blocks
+            .iter()
+            .map(|b| b.bbox.x)
+            .fold(f64::MAX, f64::min)
+            .min(anchor.bbox.x);
+        let max_right = blocks
+            .iter()
+            .map(|b| b.bbox.x + b.bbox.width)
+            .fold(0.0, f64::max)
+            .max(anchor.bbox.x + anchor.bbox.width);
 
-        union_box
+        // 垂直范围：从 anchor 的 y 到 y_end（下一题开始前）
+        let y_start = anchor.bbox.y;
+        let height = (y_end - y_start).max(anchor.bbox.height);
+
+        Rect::new(min_x, y_start, max_right - min_x, height)
     }
 
     /// 计算置信度

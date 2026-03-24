@@ -268,10 +268,11 @@ impl QuestionLocator {
             let is_substantial = info.width > image_width as f64 * 0.15
                 || info.first_block_width < 60.0;
 
-            // 排除标题行特征：居中且较窄的行
+            // 排除标题行特征：居中且不从左侧边缘开始的行
+            // 标题行的特点：中心接近页面中心，且起始位置不在左边缘
             let center_x = info.x_start + info.width / 2.0;
-            let is_centered = (center_x - image_width as f64 / 2.0).abs() < image_width as f64 * 0.1
-                && info.width < image_width as f64 * 0.5;
+            let is_centered = (center_x - image_width as f64 / 2.0).abs() < image_width as f64 * 0.15
+                && info.x_start > image_width as f64 * 0.15;
 
             if is_near_left && is_substantial && !is_centered {
                 // 检查与上一个 anchor 的间距——太近则视为续行，跳过
@@ -322,6 +323,9 @@ impl QuestionLocator {
             );
             anchors = self.infer_from_line_gaps(&line_info, image_width)?;
         }
+
+        // 过滤可能的章节标题行（块高度明显大于平均值的行）
+        anchors = self.filter_section_headers(anchors, blocks);
 
         Ok(anchors)
     }
@@ -438,6 +442,102 @@ impl QuestionLocator {
             .copied()
             .collect();
         cluster.iter().sum::<f64>() / cluster.len() as f64
+    }
+
+    /// 过滤可能的章节标题行
+    ///
+    /// 章节标题（如"一、仔细想..."、"二、小小裁判员..."）通常具有以下特征：
+    /// 1. 块高度明显大于正文（使用更大的字号）
+    /// 2. 位于文档的大段落分隔处
+    fn filter_section_headers(
+        &self,
+        anchors: Vec<QuestionAnchor>,
+        blocks: &[TextBlock],
+    ) -> Vec<QuestionAnchor> {
+        if anchors.len() < 3 || blocks.is_empty() {
+            return anchors;
+        }
+
+        // 计算全局块高度中位数
+        let mut all_heights: Vec<f64> = blocks.iter().map(|b| b.bbox.height).collect();
+        all_heights.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median_height = all_heights[all_heights.len() / 2];
+
+        // 计算 anchor 间距的中位数
+        let mut gaps: Vec<f64> = anchors
+            .windows(2)
+            .map(|w| w[1].bbox.y - w[0].bbox.y)
+            .collect();
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median_gap = if gaps.is_empty() {
+            40.0
+        } else {
+            gaps[gaps.len() / 2]
+        };
+
+        let mut result = vec![];
+
+        for (i, anchor) in anchors.iter().enumerate() {
+            // 找到该 anchor 行的所有 blocks
+            let line_blocks: Vec<&TextBlock> = blocks
+                .iter()
+                .filter(|b| (b.bbox.y - anchor.bbox.y).abs() < median_height * 0.8)
+                .collect();
+
+            if line_blocks.is_empty() {
+                result.push(anchor.clone());
+                continue;
+            }
+
+            let line_avg_height =
+                line_blocks.iter().map(|b| b.bbox.height).sum::<f64>() / line_blocks.len() as f64;
+
+            // 特征1：该行的块高度明显大于中位数（大字号章节标题）
+            let is_tall = line_avg_height > median_height * 1.1;
+
+            // 特征2：该行前方有大间距（段落分隔）
+            let gap_before = if i > 0 {
+                anchor.bbox.y - anchors[i - 1].bbox.y
+            } else {
+                0.0
+            };
+            let has_large_gap_before = gap_before > median_gap * 2.0;
+
+            // 特征3：是否是第一个 anchor（第一个 anchor 如果是高块，很可能是章节标题）
+            let is_first = i == 0;
+
+            // 判定为章节标题的条件（保守策略，避免误删真实题目）：
+            // - 块高度偏大 AND（是第一个 anchor 或前方有大间距）
+            // - 或者：位于大间距之后，且该行块数量较多（标题描述较长）
+            let is_section_header = (is_tall && (is_first || has_large_gap_before))
+                || (has_large_gap_before && line_blocks.len() > 15);
+
+            if is_section_header {
+                log::info!(
+                    "Filtering section header at y={:.0} (avg_h={:.1} vs median={:.1}, gap_before={:.0}, blocks={})",
+                    anchor.bbox.y,
+                    line_avg_height,
+                    median_height,
+                    gap_before,
+                    line_blocks.len()
+                );
+            } else {
+                result.push(anchor.clone());
+            }
+        }
+
+        // 重新编号
+        for (i, anchor) in result.iter_mut().enumerate() {
+            anchor.question_id = (i + 1).to_string();
+            anchor.text = format!("{}.", i + 1);
+        }
+
+        log::info!(
+            "After section header filtering: {} -> {} anchors",
+            anchors.len(),
+            result.len()
+        );
+        result
     }
 
     /// 基于行间距变化推断题目边界
