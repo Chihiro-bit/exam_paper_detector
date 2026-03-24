@@ -2,6 +2,10 @@
 
 基于 Flutter + Rust + flutter_rust_bridge 的跨平台试卷题目自动识别系统。
 
+# 使用示例图
+
+![使用示例](screenshot/img.png)
+
 ## 架构特点
 
 - **Flutter Plugin**: 标准 Flutter 插件架构
