@@ -7,6 +7,9 @@ Cargo.lock
 *.so
 *.dylib
 
+# Android JNI libs (built from Rust by cargo-ndk)
+android/src/main/jniLibs/
+
 # Dart/Flutter
 .dart_tool/
 .packages

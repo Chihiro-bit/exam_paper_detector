@@ -1,0 +1,130 @@
+group 'com.example.exam_paper_detector'
+version '1.0'
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.1.0'
+    }
+}
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: 'com.android.library'
+
+android {
+    namespace 'com.example.exam_paper_detector'
+    compileSdk 34
+
+    defaultConfig {
+        minSdk 21
+        ndk {
+            abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+// ============================================================
+// Rust cross-compilation for Android via cargo-ndk
+// ============================================================
+
+def rustDir = file("${projectDir}/../rust")
+def jniLibsDir = file("${projectDir}/src/main/jniLibs")
+def libName = "libexam_paper_detector.so"
+
+// Detect Android NDK path from local.properties or environment
+def findNdkDir() {
+    // 1. Environment variable
+    def ndkHome = System.getenv("ANDROID_NDK_HOME")
+    if (ndkHome != null && file(ndkHome).exists()) return ndkHome
+
+    // 2. From Android SDK
+    def sdkDir = System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT")
+
+    // 3. Try local.properties
+    if (sdkDir == null) {
+        def localProps = new Properties()
+        def localPropsFile = rootProject.file('local.properties')
+        if (localPropsFile.exists()) {
+            localProps.load(localPropsFile.newDataInputStream())
+            sdkDir = localProps.getProperty('sdk.dir')
+        }
+    }
+
+    if (sdkDir != null) {
+        // Check versioned NDK directory, pick the latest
+        def ndkDir = file("${sdkDir}/ndk")
+        if (ndkDir.exists()) {
+            def versions = ndkDir.listFiles()?.sort()?.reverse()
+            if (versions != null && versions.length > 0) {
+                return versions[0].absolutePath
+            }
+        }
+        // Fallback: ndk-bundle
+        def ndkBundle = file("${sdkDir}/ndk-bundle")
+        if (ndkBundle.exists()) return ndkBundle.absolutePath
+    }
+    return null
+}
+
+task buildRustForAndroid {
+    description = 'Compiles Rust code for Android targets using cargo-ndk'
+
+    def rustSources = fileTree(dir: rustDir, includes: ['src/**/*.rs', 'Cargo.toml'])
+    inputs.files(rustSources)
+    outputs.dir(jniLibsDir)
+
+    doLast {
+        def ndkDir = findNdkDir()
+        if (ndkDir == null) {
+            throw new GradleException(
+                "Android NDK not found. Set ANDROID_NDK_HOME environment variable " +
+                "or install NDK via Android Studio SDK Manager."
+            )
+        }
+
+        logger.lifecycle("Using Android NDK: ${ndkDir}")
+        logger.lifecycle("Building Rust library for Android targets...")
+
+        exec {
+            workingDir rustDir
+            environment 'ANDROID_NDK_HOME', ndkDir
+            commandLine 'cargo', 'ndk',
+                '-t', 'arm64-v8a',
+                '-t', 'armeabi-v7a',
+                '-t', 'x86_64',
+                '-o', jniLibsDir.absolutePath,
+                'build', '--release'
+        }
+
+        // Verify output
+        ['arm64-v8a', 'armeabi-v7a', 'x86_64'].each { abi ->
+            def soFile = file("${jniLibsDir}/${abi}/${libName}")
+            if (!soFile.exists()) {
+                throw new GradleException("Build succeeded but ${soFile} not found!")
+            }
+            logger.lifecycle("  Built: ${abi}/${libName} (${soFile.length() / 1024} KB)")
+        }
+    }
+}
+
+// Automatically build Rust before merging JNI libraries
+tasks.configureEach { task ->
+    if (task.name.contains('merge') && task.name.contains('JniLibFolders')) {
+        task.dependsOn 'buildRustForAndroid'
+    }
+}
