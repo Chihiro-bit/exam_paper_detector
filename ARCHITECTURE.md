@@ -43,8 +43,9 @@
 │                         ▼                                │
 │  ┌──────────────────────────────────────────────────┐  │
 │  │     OCR Adapter Layer                            │  │
-│  │  - OCR Trait 定义                                 │  │
-│  │  - Tesseract Adapter                             │  │
+│  │  - OCR Trait 定义 (OcrEngineT)                   │  │
+│  │  - PaddleOCR (Paddle Inference C API, 推荐)      │  │
+│  │  - Mock OCR (用于测试)                            │  │
 │  │  - 可扩展其他 OCR 引擎                            │  │
 │  └──────────────────────────────────────────────────┘  │
 │                         ▼                                │
@@ -317,16 +318,50 @@ pub extern "C" fn detector_last_error() -> *const c_char;
 ### 4.1 OCR 引擎可替换
 
 ```rust
-pub trait OcrEngine {
-    fn recognize(&self, image: &Image, config: &OcrConfig) -> Result<Vec<TextBlock>>;
-    fn recognize_region(&self, image: &Image, region: Rect, config: &OcrConfig) -> Result<String>;
+pub trait OcrEngineT: Send + Sync {
+    fn recognize(&self, image: &DynamicImage) -> anyhow::Result<Vec<OcrResult>>;
+    fn recognize_region(&self, image: &DynamicImage, region: Rect) -> anyhow::Result<String>;
 }
 
-// 支持多种实现
-impl OcrEngine for TesseractEngine { ... }
-impl OcrEngine for PaddleOcrEngine { ... }
-impl OcrEngine for CustomEngine { ... }
+// 当前实现
+impl OcrEngineT for PaddleOcrEngine { ... }  // Paddle Inference C API
+impl OcrEngineT for MockOcrEngine { ... }    // 测试用
 ```
+
+#### PaddleOCR 集成方案
+
+采用 **Paddle Inference C API** 方案，通过 Rust FFI 直接调用 PaddlePaddle C++ 推理库：
+
+```
+PaddleOCR 模型 (原生 Paddle 格式)
+    ↓ Paddle Inference C API
+Rust FFI 绑定 (paddle_ffi.rs)
+    ↓
+PaddleOcrEngine (ocr_paddle.rs)
+    ↓ OcrEngineT trait
+OcrAdapter → Detector pipeline
+```
+
+**关键文件**：
+- `rust/src/paddle_ffi.rs` — Paddle Inference C API 的 Rust FFI 绑定
+- `rust/src/ocr_paddle.rs` — PaddleOCR 引擎实现（det + rec pipeline）
+- `rust/build.rs` — 链接 Paddle Inference C 库
+
+**模型目录结构**：
+```
+models/
+├── det/
+│   ├── inference.pdmodel      # 文字检测模型
+│   └── inference.pdiparams
+├── rec/
+│   ├── inference.pdmodel      # 文字识别模型
+│   └── inference.pdiparams
+└── ppocr_keys.txt             # 字符字典 (6000+ 中英文字符)
+```
+
+**依赖**：
+- Paddle Inference C 预编译库 (v2.4.0)，放在 `rust/paddle_inference/`
+- 无需 Python 运行时，无需 ONNX 转换
 
 ### 4.2 预处理管道可配置
 

@@ -3,6 +3,7 @@
 //! 提供统一的 OCR 接口，支持多种 OCR 引擎
 
 use crate::geometry::Rect;
+use crate::ocr_paddle::PaddleOcrEngine;
 use crate::types::{OcrConfig, OcrEngine};
 use image::DynamicImage;
 
@@ -33,9 +34,23 @@ impl OcrAdapter {
     /// 创建 OCR 适配器
     pub fn new(config: &OcrConfig) -> anyhow::Result<Self> {
         let engine: Box<dyn OcrEngineT> = match config.engine {
+            OcrEngine::PaddleOCR => {
+                let model_dir = config
+                    .model_dir
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "PaddleOCR engine requires model_dir to be set. \
+                             It should contain: det/, rec/ (Paddle models), ppocr_keys.txt"
+                        )
+                    })?;
+                Box::new(PaddleOcrEngine::new(
+                    model_dir,
+                    config.confidence_threshold,
+                )?)
+            }
             OcrEngine::Mock => Box::new(MockOcrEngine::new()),
             OcrEngine::Tesseract => {
-                // TODO: 实现 Tesseract 适配器
                 log::warn!("Tesseract not implemented, using Mock OCR");
                 Box::new(MockOcrEngine::new())
             }

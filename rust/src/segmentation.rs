@@ -55,7 +55,7 @@ impl QuestionSegmenter {
             let bounding_box = self.calculate_bounding_box(&question_blocks, anchor, y_end - margin);
 
             // 计算置信度
-            let confidence = self.calculate_confidence(anchor, &question_blocks);
+            let confidence = self.calculate_confidence(anchor, &question_blocks, y_start, y_end);
 
             // 生成 Debug 信息
             let debug_info = if include_debug {
@@ -89,21 +89,35 @@ impl QuestionSegmenter {
     fn find_question_blocks(
         &self,
         all_blocks: &[TextBlock],
-        _anchor: &QuestionAnchor,
+        anchor: &QuestionAnchor,
         y_start: f64,
         y_end: f64,
     ) -> Vec<TextBlock> {
         let mut question_blocks = vec![];
 
-        // 题号锚点本身也算一个 block
-        // （虽然它可能不在 all_blocks 中）
+        // 计算锚点所在列的水平范围限制
+        // 允许 blocks 在锚点 x 位置 2 倍范围内（从左边界算起）
+        let x_limit = anchor.bbox.x * 2.0 + anchor.bbox.width;
 
         for block in all_blocks {
-            // 检查 block 是否在垂直范围内
-            if block.bbox.y >= y_start && block.bbox.y < y_end {
-                // 进一步检查水平对齐关系
-                // 简化实现：接受所有在范围内的 blocks
-                question_blocks.push(block.clone());
+            // 使用 block 的垂直中心来判断归属，处理跨边界的 blocks
+            let block_center_y = block.bbox.y + block.bbox.height / 2.0;
+
+            if block_center_y >= y_start && block_center_y < y_end {
+                // x-range 验证：block 应与锚点的列区域水平重叠
+                let block_right = block.bbox.x + block.bbox.width;
+                if block.bbox.x < x_limit && block_right > 0.0 {
+                    question_blocks.push(block.clone());
+                }
+            } else if block.bbox.y >= y_start && block.bbox.y < y_end {
+                // 对于垂直中心不在范围内但起始位置在范围内的 block，
+                // 检查是否为缩进的子题（如 (1), (2), ①②③）
+                if self.is_sub_question(block) {
+                    let block_right = block.bbox.x + block.bbox.width;
+                    if block.bbox.x < x_limit && block_right > 0.0 {
+                        question_blocks.push(block.clone());
+                    }
+                }
             }
         }
 
@@ -116,6 +130,31 @@ impl QuestionSegmenter {
         });
 
         question_blocks
+    }
+
+    /// 检测 block 是否为缩进的子题目
+    fn is_sub_question(&self, block: &TextBlock) -> bool {
+        if let Some(ref text) = block.text {
+            let trimmed = text.trim();
+            // 匹配 (1), (2), ... 格式
+            if trimmed.starts_with('(') && trimmed.len() >= 3 {
+                let inner = &trimmed[1..];
+                if let Some(pos) = inner.find(')') {
+                    let num_part = &inner[..pos];
+                    if num_part.chars().all(|c| c.is_ascii_digit()) {
+                        return true;
+                    }
+                }
+            }
+            // 匹配 ①②③④⑤⑥⑦⑧⑨⑩ 等圆圈数字
+            if trimmed.starts_with(|c: char| {
+                ('\u{2460}'..='\u{2473}').contains(&c) // ①-⑳
+                    || ('\u{3251}'..='\u{325F}').contains(&c) // ㉑-㉟
+            }) {
+                return true;
+            }
+        }
+        false
     }
 
     /// 计算题目边界框
@@ -152,12 +191,18 @@ impl QuestionSegmenter {
     }
 
     /// 计算置信度
-    fn calculate_confidence(&self, anchor: &QuestionAnchor, blocks: &[TextBlock]) -> f64 {
+    fn calculate_confidence(
+        &self,
+        anchor: &QuestionAnchor,
+        blocks: &[TextBlock],
+        y_start: f64,
+        y_end: f64,
+    ) -> f64 {
         // 综合评分：
         // - 题号识别置信度 × 0.4
         // - 几何一致性 × 0.3
         // - Block 数量合理性 × 0.2
-        // - 其他因素 × 0.1
+        // - 垂直覆盖率 × 0.1
 
         let anchor_confidence = anchor.confidence * 0.4;
 
@@ -173,9 +218,13 @@ impl QuestionSegmenter {
             0.3
         } * 0.2;
 
-        let base_score = 0.1;
+        // 垂直覆盖率：blocks 高度之和 / 题目区域高度
+        let region_height = (y_end - y_start).max(1.0);
+        let total_block_height: f64 = blocks.iter().map(|b| b.bbox.height).sum();
+        let coverage_ratio = total_block_height / region_height;
+        let coverage_score = (coverage_ratio * 1.2).min(1.0) * 0.1;
 
-        anchor_confidence + geometric_score + block_count_score + base_score
+        anchor_confidence + geometric_score + block_count_score + coverage_score
     }
 
     /// 计算几何一致性
@@ -226,11 +275,18 @@ impl QuestionSegmenter {
     pub fn fallback_segment(&self, blocks: &[TextBlock]) -> anyhow::Result<Vec<QuestionBox>> {
         log::info!("Using fallback segmentation (paragraph mode)");
 
+        if blocks.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // 计算自适应间距阈值：使用中位数行间距 * 2.0
+        let threshold = self.calculate_adaptive_threshold(blocks);
+        log::debug!("Adaptive paragraph threshold: {:.1}px", threshold);
+
         // 按大的垂直间距分段
         let mut questions = vec![];
         let mut current_blocks = vec![];
         let mut last_y = 0.0;
-        let threshold = 50.0; // 超过 50 像素的间距认为是段落分隔
 
         for block in blocks {
             if !current_blocks.is_empty() && block.bbox.y - last_y > threshold {
@@ -258,6 +314,47 @@ impl QuestionSegmenter {
 
         log::info!("Fallback segmentation created {} questions", questions.len());
         Ok(questions)
+    }
+
+    /// 计算自适应段落间距阈值
+    ///
+    /// 使用所有 blocks 之间的行间距中位数 * 2.0 作为"显著间隙"阈值
+    fn calculate_adaptive_threshold(&self, blocks: &[TextBlock]) -> f64 {
+        if blocks.len() < 2 {
+            return 50.0; // 不够数据时回退到默认值
+        }
+
+        // 按 y 排序后计算相邻 block 间的间距
+        let mut sorted: Vec<&TextBlock> = blocks.iter().collect();
+        sorted.sort_by(|a, b| {
+            a.bbox
+                .y
+                .partial_cmp(&b.bbox.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut gaps: Vec<f64> = Vec::with_capacity(sorted.len() - 1);
+        for i in 1..sorted.len() {
+            let gap = sorted[i].bbox.y - (sorted[i - 1].bbox.y + sorted[i - 1].bbox.height);
+            if gap > 0.0 {
+                gaps.push(gap);
+            }
+        }
+
+        if gaps.is_empty() {
+            return 50.0;
+        }
+
+        // 计算中位数
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = if gaps.len() % 2 == 0 {
+            (gaps[gaps.len() / 2 - 1] + gaps[gaps.len() / 2]) / 2.0
+        } else {
+            gaps[gaps.len() / 2]
+        };
+
+        // 显著间隙 = 2x 正常行间距，但不低于 20px
+        (median * 2.0).max(20.0)
     }
 
     /// 从 blocks 创建题目

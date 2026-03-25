@@ -64,7 +64,7 @@ impl BlockDetector {
         Ok(text_blocks)
     }
 
-    /// 连通域分析（简化版）
+    /// 连通域分析（Union-Find, 8-connectivity）
     fn find_connected_components(&self, image: &GrayImage) -> anyhow::Result<Vec<Rect>> {
         let width = image.width() as usize;
         let height = image.height() as usize;
@@ -72,62 +72,84 @@ impl BlockDetector {
         // 标记数组
         let mut labels = vec![vec![0usize; width]; height];
         let mut next_label = 1usize;
-        let mut components: Vec<ComponentInfo> = vec![];
+        let mut uf = UnionFind::new();
 
-        // 第一次扫描：标记连通域
+        // 第一次扫描：标记连通域，合并等价标签
         for y in 0..height {
             for x in 0..width {
                 let pixel = image.get_pixel(x as u32, y as u32)[0];
 
                 // 只处理前景像素（黑色文字）
                 if pixel < 128 {
-                    let mut neighbors = vec![];
+                    let mut neighbor_labels = vec![];
 
-                    // 检查上方和左方的邻居
-                    if y > 0 && labels[y - 1][x] > 0 {
-                        neighbors.push(labels[y - 1][x]);
+                    // 8-connectivity: 检查上方、左方、左上、右上的邻居
+                    if y > 0 {
+                        // 上方
+                        if labels[y - 1][x] > 0 {
+                            neighbor_labels.push(labels[y - 1][x]);
+                        }
+                        // 左上
+                        if x > 0 && labels[y - 1][x - 1] > 0 {
+                            neighbor_labels.push(labels[y - 1][x - 1]);
+                        }
+                        // 右上
+                        if x + 1 < width && labels[y - 1][x + 1] > 0 {
+                            neighbor_labels.push(labels[y - 1][x + 1]);
+                        }
                     }
+                    // 左方
                     if x > 0 && labels[y][x - 1] > 0 {
-                        neighbors.push(labels[y][x - 1]);
+                        neighbor_labels.push(labels[y][x - 1]);
                     }
 
-                    if neighbors.is_empty() {
+                    if neighbor_labels.is_empty() {
                         // 新的连通域
                         labels[y][x] = next_label;
-                        components.push(ComponentInfo {
-                            label: next_label,
-                            min_x: x,
-                            max_x: x,
-                            min_y: y,
-                            max_y: y,
-                        });
+                        uf.make_set(next_label);
                         next_label += 1;
                     } else {
-                        // 使用最小标签
-                        let min_label = *neighbors.iter().min().unwrap();
+                        // 使用最小标签，并 union 所有邻居标签
+                        let min_label = *neighbor_labels.iter().min().unwrap();
                         labels[y][x] = min_label;
 
-                        // 更新边界
-                        if let Some(comp) = components.iter_mut().find(|c| c.label == min_label) {
-                            comp.min_x = comp.min_x.min(x);
-                            comp.max_x = comp.max_x.max(x);
-                            comp.min_y = comp.min_y.min(y);
-                            comp.max_y = comp.max_y.max(y);
+                        for &lbl in &neighbor_labels {
+                            if lbl != min_label {
+                                uf.union(min_label, lbl);
+                            }
                         }
                     }
                 }
             }
         }
 
+        // 第二次扫描：收集每个根标签的 bounding box
+        let mut bboxes: std::collections::HashMap<usize, (usize, usize, usize, usize)> =
+            std::collections::HashMap::new();
+
+        for y in 0..height {
+            for x in 0..width {
+                let lbl = labels[y][x];
+                if lbl > 0 {
+                    let root = uf.find(lbl);
+                    let entry = bboxes.entry(root).or_insert((x, x, y, y));
+                    entry.0 = entry.0.min(x);
+                    entry.1 = entry.1.max(x);
+                    entry.2 = entry.2.min(y);
+                    entry.3 = entry.3.max(y);
+                }
+            }
+        }
+
         // 转换为 Rect
-        let rects: Vec<Rect> = components
-            .into_iter()
-            .map(|comp| {
+        let rects: Vec<Rect> = bboxes
+            .values()
+            .map(|&(min_x, max_x, min_y, max_y)| {
                 Rect::new(
-                    comp.min_x as f64,
-                    comp.min_y as f64,
-                    (comp.max_x - comp.min_x + 1) as f64,
-                    (comp.max_y - comp.min_y + 1) as f64,
+                    min_x as f64,
+                    min_y as f64,
+                    (max_x - min_x + 1) as f64,
+                    (max_y - min_y + 1) as f64,
                 )
             })
             .collect();
@@ -162,9 +184,10 @@ impl BlockDetector {
         // 按行分组
         let lines = self.group_into_lines(blocks, avg_height * 0.5);
 
-        // 在每一行内，用较小间距阈值合并（字符间距，而非词间距）
-        // 使用 avg_height * 0.2 而不是 0.3，更保守地合并
-        let char_gap = avg_height * 0.15;
+        // 在每一行内，用适当间距阈值合并字符组件
+        // 使用 avg_height * 0.3 以合并属于同一词/短语的字符碎片，
+        // 但限制最大间距为 15px 以防止过度合并
+        let char_gap = (avg_height * 0.3).min(15.0);
 
         let mut merged = vec![];
         for line in lines {
@@ -290,14 +313,53 @@ impl BlockDetector {
     }
 }
 
-/// 连通域信息
-#[derive(Debug, Clone)]
-struct ComponentInfo {
-    label: usize,
-    min_x: usize,
-    max_x: usize,
-    min_y: usize,
-    max_y: usize,
+/// Union-Find（并查集）数据结构，支持路径压缩和按秩合并
+struct UnionFind {
+    parent: std::collections::HashMap<usize, usize>,
+    rank: std::collections::HashMap<usize, usize>,
+}
+
+impl UnionFind {
+    fn new() -> Self {
+        Self {
+            parent: std::collections::HashMap::new(),
+            rank: std::collections::HashMap::new(),
+        }
+    }
+
+    fn make_set(&mut self, x: usize) {
+        self.parent.insert(x, x);
+        self.rank.insert(x, 0);
+    }
+
+    fn find(&mut self, x: usize) -> usize {
+        let p = *self.parent.get(&x).unwrap_or(&x);
+        if p != x {
+            let root = self.find(p);
+            self.parent.insert(x, root);
+            root
+        } else {
+            x
+        }
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return;
+        }
+        let rank_a = *self.rank.get(&ra).unwrap_or(&0);
+        let rank_b = *self.rank.get(&rb).unwrap_or(&0);
+        if rank_a < rank_b {
+            self.parent.insert(ra, rb);
+        } else if rank_a > rank_b {
+            self.parent.insert(rb, ra);
+        } else {
+            self.parent.insert(rb, ra);
+            self.rank.insert(ra, rank_a + 1);
+        }
+    }
 }
 
 /// 分栏信息

@@ -2,8 +2,9 @@
 //!
 //! 包含：灰度化、去噪、二值化、对比度增强等功能
 
-use image::{DynamicImage, GrayImage, ImageBuffer, Luma, Pixel};
+use image::{DynamicImage, GrayImage, ImageBuffer, Luma, Pixel, Rgba};
 use imageproc::contrast::{threshold as fixed_threshold, ThresholdType};
+use imageproc::geometric_transformations::{rotate_about_center, Interpolation};
 use std::path::Path;
 
 use crate::types::{BinarizationMethod, PreprocessingConfig};
@@ -36,12 +37,33 @@ impl Preprocessor {
         log::info!("Loading image from: {}", image_path);
 
         // 加载图像
-        let original = image::open(Path::new(image_path))?;
+        let mut original = image::open(Path::new(image_path))?;
 
         log::info!("Image size: {}x{}", original.width(), original.height());
 
         // 转换为灰度图
         let mut grayscale = self.to_grayscale(&original);
+
+        // 倾斜校正
+        if self.config.enable_deskew {
+            log::debug!("Applying deskew...");
+            let (deskewed_gray, angle) = self.deskew(&grayscale);
+            if angle.abs() > 0.01 {
+                log::info!("Detected skew angle: {:.2}°, correcting...", angle);
+                grayscale = deskewed_gray;
+                // Also rotate the original image by the same angle
+                let rgba = original.to_rgba8();
+                let rotated_rgba = rotate_about_center(
+                    &rgba,
+                    angle.to_radians() as f32,
+                    Interpolation::Bilinear,
+                    Rgba([255u8, 255u8, 255u8, 255u8]),
+                );
+                original = DynamicImage::ImageRgba8(rotated_rgba);
+            } else {
+                log::debug!("No significant skew detected (angle: {:.4}°)", angle);
+            }
+        }
 
         // 去噪
         if self.config.enable_denoise {
@@ -181,27 +203,34 @@ impl Preprocessor {
         best_threshold
     }
 
-    /// 自适应二值化
+    /// 自适应二值化（使用积分图实现 O(1) 局部均值查询）
     fn adaptive_binarize(&self, image: &GrayImage) -> GrayImage {
-        // 使用局部自适应阈值
-        let block_size = 15; // 窗口大小
-        let c = 5; // 常数
-
         let width = image.width();
         let height = image.height();
+
+        // 动态窗口大小：根据图像分辨率自适应
+        let min_dim = width.min(height);
+        let block_size = 15u32.max(min_dim / 40);
+        let half_size = block_size / 2;
+        let c: u8 = 10; // 常数（噪声容忍度）
+
+        log::debug!(
+            "Adaptive binarize: image {}x{}, block_size={}, c={}",
+            width, height, block_size, c
+        );
+
+        // 计算积分图
+        let integral = self.compute_integral_image(image);
+
         let mut result = ImageBuffer::new(width, height);
 
         for y in 0..height {
             for x in 0..width {
-                // 计算局部窗口的均值
-                let local_mean = self.calculate_local_mean(image, x, y, block_size);
+                let local_mean =
+                    Self::query_integral_mean(&integral, x, y, half_size, width, height);
 
                 let pixel_value = image.get_pixel(x, y)[0];
-                let threshold_value = if local_mean > c {
-                    local_mean - c
-                } else {
-                    0
-                };
+                let threshold_value = local_mean.saturating_sub(c);
 
                 let binary_value = if pixel_value > threshold_value { 255 } else { 0 };
                 result.put_pixel(x, y, Luma([binary_value]));
@@ -211,35 +240,176 @@ impl Preprocessor {
         result
     }
 
-    /// 计算局部均值
-    fn calculate_local_mean(&self, image: &GrayImage, cx: u32, cy: u32, size: u32) -> u8 {
-        let width = image.width();
-        let height = image.height();
-        if width == 0 || height == 0 {
-            return 128;
-        }
-        let half_size = size / 2;
+    /// 计算积分图（Summed Area Table）
+    ///
+    /// integral[y][x] = sum of all pixels in image[0..=y-1][0..=x-1]
+    /// 使用 1-indexed 以简化边界处理（第 0 行/列为 0）
+    fn compute_integral_image(&self, image: &GrayImage) -> Vec<Vec<u64>> {
+        let width = image.width() as usize;
+        let height = image.height() as usize;
 
-        let x_start = cx.saturating_sub(half_size);
-        let x_end = (cx + half_size).min(width.saturating_sub(1));
-        let y_start = cy.saturating_sub(half_size);
-        let y_end = (cy + half_size).min(height.saturating_sub(1));
+        // (height+1) x (width+1)，第 0 行和第 0 列全为 0
+        let mut integral = vec![vec![0u64; width + 1]; height + 1];
 
-        let mut sum = 0u32;
-        let mut count = 0u32;
-
-        for y in y_start..=y_end {
-            for x in x_start..=x_end {
-                sum += image.get_pixel(x, y)[0] as u32;
-                count += 1;
+        for y in 0..height {
+            let mut row_sum = 0u64;
+            for x in 0..width {
+                row_sum += image.get_pixel(x as u32, y as u32)[0] as u64;
+                integral[y + 1][x + 1] = integral[y][x + 1] + row_sum;
             }
         }
 
-        if count > 0 {
-            (sum / count) as u8
-        } else {
-            128
+        integral
+    }
+
+    /// 使用积分图进行 O(1) 局部均值查询
+    ///
+    /// 查询以 (x, y) 为中心、半径为 half_size 的窗口内像素均值
+    fn query_integral_mean(
+        integral: &[Vec<u64>],
+        x: u32,
+        y: u32,
+        half_size: u32,
+        width: u32,
+        height: u32,
+    ) -> u8 {
+        // 计算窗口边界（clamp 到图像范围）
+        let x1 = x.saturating_sub(half_size) as usize;
+        let y1 = y.saturating_sub(half_size) as usize;
+        let x2 = ((x + half_size) as usize).min((width as usize).saturating_sub(1));
+        let y2 = ((y + half_size) as usize).min((height as usize).saturating_sub(1));
+
+        if x2 < x1 || y2 < y1 {
+            return 128;
         }
+
+        let count = ((x2 - x1 + 1) * (y2 - y1 + 1)) as u64;
+        if count == 0 {
+            return 128;
+        }
+
+        // 积分图查询：integral 是 1-indexed，所以 +1 偏移
+        // 使用 wrapping 算术避免中间步骤溢出（inclusion-exclusion 保证最终结果正确）
+        let sum = integral[y2 + 1][x2 + 1]
+            .wrapping_sub(integral[y1][x2 + 1])
+            .wrapping_sub(integral[y2 + 1][x1])
+            .wrapping_add(integral[y1][x1]);
+
+        (sum / count) as u8
+    }
+
+    /// 倾斜校正
+    ///
+    /// 使用水平投影方差法检测倾斜角度，并旋转校正。
+    /// 返回校正后的灰度图和检测到的角度（度）。
+    fn deskew(&self, image: &GrayImage) -> (GrayImage, f64) {
+        let (width, height) = image.dimensions();
+
+        // 对于大图像，缩小以加速角度检测
+        let scale = if height > 800 {
+            800.0 / height as f64
+        } else {
+            1.0
+        };
+
+        let small = if scale < 1.0 {
+            let new_w = (width as f64 * scale) as u32;
+            let new_h = (height as f64 * scale) as u32;
+            image::imageops::resize(image, new_w, new_h, image::imageops::FilterType::Nearest)
+        } else {
+            image.clone()
+        };
+
+        // 候选角度：-5° 到 5°，步长 0.5°
+        let mut best_angle = 0.0f64;
+        let mut best_variance = 0.0f64;
+
+        let mut angle = -5.0f64;
+        while angle <= 5.0 {
+            let radians = angle.to_radians() as f32;
+            let rotated = rotate_about_center(
+                &small,
+                radians,
+                Interpolation::Bilinear,
+                Luma([255u8]),
+            );
+
+            let variance = Self::horizontal_projection_variance(&rotated);
+
+            if variance > best_variance {
+                best_variance = variance;
+                best_angle = angle;
+            }
+
+            angle += 0.5;
+        }
+
+        // 精细搜索：在最佳角度附近 +/- 0.5° 内以 0.1° 步长搜索
+        let fine_start = best_angle - 0.5;
+        let fine_end = best_angle + 0.5;
+        let mut angle = fine_start;
+        while angle <= fine_end {
+            let radians = angle.to_radians() as f32;
+            let rotated = rotate_about_center(
+                &small,
+                radians,
+                Interpolation::Bilinear,
+                Luma([255u8]),
+            );
+
+            let variance = Self::horizontal_projection_variance(&rotated);
+
+            if variance > best_variance {
+                best_variance = variance;
+                best_angle = angle;
+            }
+
+            angle += 0.1;
+        }
+
+        log::debug!("Deskew: best angle = {:.2}°, variance = {:.2}", best_angle, best_variance);
+
+        // 对原始大小图像应用旋转
+        if best_angle.abs() < 0.01 {
+            return (image.clone(), 0.0);
+        }
+
+        let corrected = rotate_about_center(
+            image,
+            best_angle.to_radians() as f32,
+            Interpolation::Bilinear,
+            Luma([255u8]),
+        );
+
+        (corrected, best_angle)
+    }
+
+    /// 计算水平投影的方差
+    ///
+    /// 水平投影 = 每行的黑色像素计数。文本行对齐时方差最大。
+    fn horizontal_projection_variance(image: &GrayImage) -> f64 {
+        let (width, height) = image.dimensions();
+        let mut projections = Vec::with_capacity(height as usize);
+
+        for y in 0..height {
+            let mut dark_count = 0u32;
+            for x in 0..width {
+                if image.get_pixel(x, y)[0] < 128 {
+                    dark_count += 1;
+                }
+            }
+            projections.push(dark_count as f64);
+        }
+
+        if projections.is_empty() {
+            return 0.0;
+        }
+
+        let n = projections.len() as f64;
+        let mean = projections.iter().sum::<f64>() / n;
+        let variance = projections.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / n;
+
+        variance
     }
 
     /// 保存中间结果
@@ -283,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn test_local_mean() {
+    fn test_integral_image_mean() {
         let mut img = GrayImage::new(10, 10);
 
         // 填充固定值
@@ -294,8 +464,51 @@ mod tests {
         }
 
         let preprocessor = Preprocessor::new(PreprocessingConfig::default());
-        let mean = preprocessor.calculate_local_mean(&img, 5, 5, 3);
+        let integral = preprocessor.compute_integral_image(&img);
+        let mean = Preprocessor::query_integral_mean(&integral, 5, 5, 1, 10, 10);
 
         assert_eq!(mean, 100);
+    }
+
+    #[test]
+    fn test_integral_image_correctness() {
+        // 创建一个非均匀图像验证积分图正确性
+        let mut img = GrayImage::new(4, 4);
+        // Row 0: [10, 20, 30, 40]
+        // Row 1: [50, 60, 70, 80]
+        // Row 2: [90,100,110,120]
+        // Row 3: [130,140,150,160]
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let val = ((y * 4 + x) * 10 + 10) as u8;
+                img.put_pixel(x, y, Luma([val]));
+            }
+        }
+
+        let preprocessor = Preprocessor::new(PreprocessingConfig::default());
+        let integral = preprocessor.compute_integral_image(&img);
+
+        // 全图均值：(10+20+...+160)/16 = 1360/16 = 85
+        let mean = Preprocessor::query_integral_mean(&integral, 1, 1, 10, 4, 4);
+        assert_eq!(mean, 85);
+
+        // 单像素查询 (half_size=0): pixel at (0,0) = 10
+        let single = Preprocessor::query_integral_mean(&integral, 0, 0, 0, 4, 4);
+        assert_eq!(single, 10);
+    }
+
+    #[test]
+    fn test_horizontal_projection_variance() {
+        // 均匀图像应该有0方差
+        let img = GrayImage::from_fn(10, 10, |_x, _y| Luma([128]));
+        let variance = Preprocessor::horizontal_projection_variance(&img);
+        assert!(variance < 0.001, "Uniform image should have ~0 variance");
+
+        // 交替行黑白应该有高方差
+        let img = GrayImage::from_fn(10, 10, |_x, y| {
+            if y % 2 == 0 { Luma([0]) } else { Luma([255]) }
+        });
+        let variance = Preprocessor::horizontal_projection_variance(&img);
+        assert!(variance > 0.0, "Alternating rows should have positive variance");
     }
 }

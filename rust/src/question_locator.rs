@@ -55,14 +55,18 @@ impl QuestionLocator {
     ) -> anyhow::Result<Vec<QuestionAnchor>> {
         log::info!("Locating question numbers...");
 
-        // Step 1: 基于 OCR 结果匹配题号
-        let mut anchors = self.match_from_ocr(ocr_results)?;
+        // Step 1: 并行获取 OCR 和几何推断结果
+        let ocr_anchors = self.match_from_ocr(ocr_results)?;
+        let geo_anchors = self.infer_from_geometry(blocks, image_width)?;
 
-        // Step 2: 基于几何位置推断题号（当 OCR 失败时）
-        if anchors.is_empty() {
-            log::warn!("No question numbers found from OCR, trying geometric inference");
-            anchors = self.infer_from_geometry(blocks, image_width)?;
-        }
+        log::info!(
+            "OCR anchors: {}, Geo anchors: {}",
+            ocr_anchors.len(),
+            geo_anchors.len()
+        );
+
+        // Step 2: 融合 OCR 与几何结果
+        let mut anchors = self.fuse_anchors(ocr_anchors, geo_anchors, blocks);
 
         // Step 3: 验证题号序列
         anchors = self.validate_sequence(anchors);
@@ -79,18 +83,100 @@ impl QuestionLocator {
         Ok(anchors)
     }
 
+    /// 融合 OCR 锚点与几何锚点
+    ///
+    /// 策略：
+    /// - OCR 锚点有对应的几何锚点 → 提升置信度
+    /// - OCR 锚点无对应几何锚点 → 降低置信度
+    /// - 几何锚点无对应 OCR 锚点 → 保留但低置信度
+    /// - 重叠时优先选择 OCR 锚点（包含文本信息）
+    fn fuse_anchors(
+        &self,
+        ocr_anchors: Vec<QuestionAnchor>,
+        geo_anchors: Vec<QuestionAnchor>,
+        blocks: &[TextBlock],
+    ) -> Vec<QuestionAnchor> {
+        // 计算平均行高作为匹配容差
+        let avg_line_height = if blocks.is_empty() {
+            30.0
+        } else {
+            blocks.iter().map(|b| b.bbox.height).sum::<f64>() / blocks.len() as f64
+        };
+
+        let mut fused: Vec<QuestionAnchor> = Vec::new();
+        let mut geo_matched: Vec<bool> = vec![false; geo_anchors.len()];
+
+        // 处理每个 OCR 锚点
+        for mut ocr_anchor in ocr_anchors {
+            let mut has_geo_match = false;
+            for (j, geo) in geo_anchors.iter().enumerate() {
+                let y_dist = (ocr_anchor.bbox.y - geo.bbox.y).abs();
+                if y_dist < avg_line_height {
+                    geo_matched[j] = true;
+                    has_geo_match = true;
+                }
+            }
+
+            if has_geo_match {
+                // OCR + 几何交叉验证 → 提升置信度
+                ocr_anchor.confidence =
+                    (ocr_anchor.confidence * 0.6 + 0.4).min(1.0);
+            } else {
+                // OCR 独有 → 降低置信度
+                ocr_anchor.confidence =
+                    (ocr_anchor.confidence - 0.2).max(0.0);
+            }
+
+            fused.push(ocr_anchor);
+        }
+
+        // 处理未被 OCR 匹配到的几何锚点
+        for (j, geo_anchor) in geo_anchors.into_iter().enumerate() {
+            if geo_matched[j] {
+                continue; // 已被 OCR 锚点覆盖，跳过
+            }
+
+            // 检查是否与已有的 fused 锚点重叠
+            let overlaps = fused
+                .iter()
+                .any(|a| (a.bbox.y - geo_anchor.bbox.y).abs() < avg_line_height);
+
+            if !overlaps {
+                let mut anchor = geo_anchor;
+                anchor.confidence = 0.4;
+                fused.push(anchor);
+            }
+        }
+
+        // 按 y 排序
+        fused.sort_by(|a, b| {
+            a.bbox
+                .y
+                .partial_cmp(&b.bbox.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        fused
+    }
+
     /// 从 OCR 结果中匹配题号
+    ///
+    /// OCR 可能返回整行文本（如 "1.下列关于..."），因此只检查前 10 个字符
     fn match_from_ocr(&self, ocr_results: &[OcrResult]) -> anyhow::Result<Vec<QuestionAnchor>> {
         let mut anchors = vec![];
 
         for ocr_result in ocr_results {
             let text = ocr_result.text.trim();
 
+            // 只取前 10 个字符进行模式匹配（OCR 可能返回整行文本）
+            let prefix: String = text.chars().take(10).collect();
+
             // 尝试所有模式
             for pattern in &self.patterns {
-                if pattern.regex.is_match(text) {
+                if pattern.regex.is_match(&prefix) {
                     // 提取题号
-                    if let Some(question_id) = self.extract_question_id(text, pattern.pattern_type)
+                    if let Some(question_id) =
+                        self.extract_question_id(&prefix, pattern.pattern_type)
                     {
                         anchors.push(QuestionAnchor {
                             question_id,
@@ -109,31 +195,44 @@ impl QuestionLocator {
     }
 
     /// 提取题号 ID
+    ///
+    /// 使用正则从文本中提取数字，比字符串 trim 更健壮，
+    /// 能处理 OCR 返回的额外文本（如 "1.下列" 或 "1 ."）
     fn extract_question_id(&self, text: &str, pattern_type: PatternType) -> Option<String> {
         match pattern_type {
             PatternType::Numbered => {
-                // "1." -> "1"
-                text.trim_end_matches('.').parse::<u32>().ok().map(|n| n.to_string())
+                // "1." / "1.下列" / "1 ." -> "1"
+                let re = Regex::new(r"(\d+)").ok()?;
+                re.captures(text)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str().to_string())
             }
             PatternType::Parenthesized => {
-                // "(1)" -> "1"
-                text.trim_start_matches('(')
-                    .trim_end_matches(')')
-                    .parse::<u32>()
-                    .ok()
-                    .map(|n| n.to_string())
+                // "(1)" / "(1)下列" -> "1"
+                let re = Regex::new(r"\((\d+)\)").ok()?;
+                re.captures(text)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str().to_string())
             }
             PatternType::Chinese => {
-                // "一、" -> "1"
-                self.chinese_to_number(text.trim_end_matches('、'))
+                // "一、" / "一、仔细想" -> "1"
+                // 提取开头连续的中文数字字符
+                let chinese_num_chars: String = text
+                    .chars()
+                    .take_while(|c| "零一二三四五六七八九十百".contains(*c))
+                    .collect();
+                if chinese_num_chars.is_empty() {
+                    None
+                } else {
+                    self.chinese_to_number(&chinese_num_chars)
+                }
             }
             PatternType::Bracketed => {
-                // "【1】" -> "1"
-                text.trim_start_matches('【')
-                    .trim_end_matches('】')
-                    .parse::<u32>()
-                    .ok()
-                    .map(|n| n.to_string())
+                // "【1】" / "【10】下列" -> "1" / "10"
+                let re = Regex::new(r"【(\d+)】").ok()?;
+                re.captures(text)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str().to_string())
             }
         }
     }
@@ -664,6 +763,7 @@ mod tests {
     fn test_extract_question_id() {
         let locator = QuestionLocator::new(vec![]).unwrap();
 
+        // Basic cases
         assert_eq!(
             locator.extract_question_id("1.", PatternType::Numbered),
             Some("1".to_string())
@@ -675,6 +775,32 @@ mod tests {
         assert_eq!(
             locator.extract_question_id("【10】", PatternType::Bracketed),
             Some("10".to_string())
+        );
+
+        // Robust extraction: OCR returns extra text
+        assert_eq!(
+            locator.extract_question_id("1.下列", PatternType::Numbered),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            locator.extract_question_id("1 .", PatternType::Numbered),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            locator.extract_question_id("(3)关于", PatternType::Parenthesized),
+            Some("3".to_string())
+        );
+        assert_eq!(
+            locator.extract_question_id("【2】下列", PatternType::Bracketed),
+            Some("2".to_string())
+        );
+        assert_eq!(
+            locator.extract_question_id("一、仔细想", PatternType::Chinese),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            locator.extract_question_id("十二、判断", PatternType::Chinese),
+            Some("12".to_string())
         );
     }
 

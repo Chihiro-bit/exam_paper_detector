@@ -14,6 +14,8 @@ pub struct DetectorConfig {
     pub question_patterns: Vec<QuestionPattern>,
     /// OCR 配置（可选）
     pub ocr: Option<OcrConfig>,
+    /// 版面分析配置（可选）
+    pub layout: Option<LayoutConfig>,
     /// Debug 配置
     pub debug: DebugConfig,
 }
@@ -24,9 +26,21 @@ impl Default for DetectorConfig {
             preprocessing: PreprocessingConfig::default(),
             question_patterns: QuestionPattern::default_patterns(),
             ocr: None,
+            layout: None,
             debug: DebugConfig::default(),
         }
     }
+}
+
+/// 版面分析配置（DocLayout-YOLO）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutConfig {
+    /// ONNX 模型文件路径
+    pub model_path: Option<String>,
+    /// 置信度阈值（默认 0.3）
+    pub confidence_threshold: Option<f32>,
+    /// 输入尺寸（默认 1024）
+    pub input_size: Option<u32>,
 }
 
 /// 预处理配置
@@ -125,11 +139,19 @@ pub struct OcrConfig {
     pub language: String,
     /// 置信度阈值
     pub confidence_threshold: f32,
+    /// 模型文件目录（PaddleOCR 引擎必填）
+    /// 该目录下应包含:
+    ///   det/inference.pdmodel + det/inference.pdiparams
+    ///   rec/inference.pdmodel + rec/inference.pdiparams
+    ///   ppocr_keys.txt
+    pub model_dir: Option<String>,
 }
 
 /// OCR 引擎类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OcrEngine {
+    /// PaddleOCR (Paddle Inference C API，推荐)
+    PaddleOCR,
     /// Tesseract OCR
     Tesseract,
     /// Mock OCR（用于测试）

@@ -64,12 +64,12 @@ pub fn init_detector(config_json: String) -> Result<bool, String> {
 pub fn process_image(image_path: String, options_json: String) -> Result<String, String> {
     log::info!("Processing image: {}", image_path);
 
-    let guard = get_detector_mutex()
+    let mut guard = get_detector_mutex()
         .lock()
         .map_err(|e| format!("Failed to lock detector: {}", e))?;
 
     let detector = guard
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| "Detector not initialized. Call init_detector first.".to_string())?;
 
     // 解析选项
@@ -105,12 +105,12 @@ pub fn process_image(image_path: String, options_json: String) -> Result<String,
 pub fn process_batch(image_paths_json: String, options_json: String) -> Result<String, String> {
     log::info!("Processing batch");
 
-    let guard = get_detector_mutex()
+    let mut guard = get_detector_mutex()
         .lock()
         .map_err(|e| format!("Failed to lock detector: {}", e))?;
 
     let detector = guard
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| "Detector not initialized. Call init_detector first.".to_string())?;
 
     let image_paths: Vec<String> = serde_json::from_str(image_paths_json.as_str())
@@ -190,12 +190,12 @@ pub fn process_image_simple(
     include_debug: bool,
 ) -> Result<SimpleDetectionResult, String> {
     // Use into_inner() to recover from a poisoned mutex
-    let guard = match get_detector_mutex().lock() {
+    let mut guard = match get_detector_mutex().lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
 
-    let detector = match guard.as_ref() {
+    let detector = match guard.as_mut() {
         Some(d) => d,
         None => {
             return Ok(SimpleDetectionResult {

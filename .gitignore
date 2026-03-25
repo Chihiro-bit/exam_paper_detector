@@ -41,5 +41,11 @@ example/build/
 example/.flutter-plugins
 example/.flutter-plugins-dependencies
 
+# Paddle Inference C library (downloaded, ~60MB+)
+rust/paddle_inference/
+
+# PaddleOCR models (downloaded, ~15MB+)
+rust/models/
+
 # Scripts
 set-proxy.bat

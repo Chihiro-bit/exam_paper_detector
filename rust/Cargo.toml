@@ -29,6 +29,13 @@ env_logger = "0.11"
 # 正则
 regex = "1.10"
 
+# PaddleOCR: Paddle Inference C API 通过 FFI 调用
+# 需要设置环境变量 PADDLE_INFERENCE_DIR 指向预编译库目录
+# 详见 scripts/download_paddle_inference.py
+
+# DocLayout-YOLO: ONNX Runtime 推理版面分析模型
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "download-binaries", "tls-native"] }
+
 
 [build-dependencies]
 flutter_rust_bridge_codegen = "2.0"
